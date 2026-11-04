@@ -1,0 +1,1 @@
+"""Mastercard stock pipeline helpers."""

@@ -1,0 +1,46 @@
+name: mastercard-stock-pipeline
+
+services:
+  airflow:
+    image: apache/airflow:2.11.0-python3.12
+    command: standalone
+    environment:
+      AIRFLOW_HOME: /opt/airflow
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
+      MASTERCARD_DATASET_PATH: /opt/airflow/data/Mastercard_stock.csv
+    ports:
+      - "127.0.0.1:${AIRFLOW_PORT:-8080}:8080"
+    volumes:
+      - airflow-home:/opt/airflow
+      - type: bind
+        source: ./dags
+        target: /opt/airflow/dags
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./data
+        target: /opt/airflow/data
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json, urllib.request;
+          health = json.load(urllib.request.urlopen('http://localhost:8080/health', timeout=5));
+          assert health['metadatabase']['status'] == health['scheduler']['status'] == 'healthy'
+      interval: 10s
+      timeout: 10s
+      start_period: 60s
+      retries: 12
+    stop_grace_period: 30s
+
+volumes:
+  airflow-home:
