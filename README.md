@@ -1,0 +1,1 @@
+# mastercard-stock-automated-data-pipeline
