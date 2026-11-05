@@ -3,7 +3,14 @@ name: mastercard-stock-pipeline
 services:
   airflow:
     image: apache/airflow:2.11.0-python3.12
-    command: standalone
+    # PID files can survive an abrupt stop because AIRFLOW_HOME is persistent.
+    # Clear the webserver's runtime PID before starting any Airflow processes.
+    command:
+      - bash
+      - -ec
+      - |
+        rm -f /opt/airflow/airflow-webserver.pid
+        exec airflow standalone
     environment:
       AIRFLOW_HOME: /opt/airflow
       AIRFLOW__CORE__EXECUTOR: SequentialExecutor

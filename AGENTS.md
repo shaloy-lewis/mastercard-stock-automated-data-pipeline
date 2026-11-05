@@ -13,9 +13,11 @@ Each dataset row represents the trading activity for one trading day.
   data out of version control.
 - Windowed ingestion is implemented in `dags/mastercard_pipeline/ingestion.py`
   and invoked by the Airflow 2.x DAG in `dags/mastercard_ingestion.py`.
-  Standard-library tests live in `tests/`; run them with
-  `python -m unittest discover -s tests -v`. See `README.md` for Airflow setup.
-  No downstream transformation or loading stage has been implemented yet.
+  Phase 2 cleaning is in `dags/mastercard_pipeline/cleaning.py`; the DAG returns
+  cleaned rows in its existing task's XCom. Tests live in `tests/`; install
+  `requirements.txt` and run `python -m unittest discover -s tests -v`.
+  See `README.md` for setup. No analytical transformation or loading stage has
+  been implemented yet.
 - `compose.yaml` provides local Airflow 2.11.0/Python 3.12 execution in Docker.
   DAGs and data are read-only mounts; the named `airflow-home` volume holds
   metadata and offsets. Preserve that volume unless a reset is explicitly intended.
@@ -56,6 +58,11 @@ Verify the source methodology before applying dividend or stock-split adjustment
 - Do not silently fill missing prices, replace missing volume with zero, drop
   invalid records, or deduplicate conflicting records. Report the issue and make
   the handling policy explicit.
+- Phase 2 explicitly skips invalid records and later duplicate trading dates,
+  logging their source row numbers and reasons. It consumes a fixed number of
+  source rows per run, including rejections, and checkpoints after cleaning the
+  window. Dates become `YYYY-MM-DD` in the source timezone; numeric strings keep
+  their exact source precision after trimming and numeric validation.
 - Trading data does not require a row for every calendar day. Do not synthesize
   weekend or holiday records unless a documented downstream use requires them.
 - Do not assume the local file is current because the dataset title says

@@ -18,6 +18,10 @@ REQUIRED_COLUMNS = {"Date", "Open", "High", "Low", "Close", "Volume"}
 LOGGER = logging.getLogger(__name__)
 
 
+class InvalidStockRow(ValueError):
+    """A data-quality failure that the cleaning stage can report and skip."""
+
+
 def _validate_row(row, row_number, seen_dates):
     """Validate source records without changing their values or timezone offsets."""
     try:
@@ -52,12 +56,16 @@ def read_stock_window(
     offset_variable=OFFSET_VARIABLE,
     *,
     variable_store=None,
+    row_transform=None,
 ):
     """Return up to window_size new rows and advance the persisted row offset.
 
     The offset counts data records, excluding the CSV header. Source values remain
-    strings. Only a completely read, valid window advances the offset. An optional
-    get/set-compatible variable_store allows offline tests without Airflow.
+    strings. An optional row_transform(row, seen_dates) can clean each record and
+    raise InvalidStockRow to reject it. Rejections consume source positions, but
+    unexpected transformation errors prevent checkpointing. Without a transform, Phase 1's
+    strict validation is retained. A get/set-compatible variable_store supports
+    offline tests without Airflow.
     Calls sharing an offset must run sequentially against the same source file.
     """
     if isinstance(window_size, bool) or not isinstance(window_size, int) or window_size <= 0:
@@ -95,18 +103,35 @@ def read_stock_window(
             raise ValueError(f"CSV is missing required columns: {', '.join(sorted(missing))}")
 
         for rows_seen, row in enumerate(reader, start=1):
-            # Validate the scanned prefix too, so duplicates across windows are detected.
-            _validate_row(row, rows_seen, seen_dates)
+            # Scan the prefix with the same policy to detect duplicates across windows.
+            transformed = None
+            if row_transform is None:
+                _validate_row(row, rows_seen, seen_dates)
+                transformed = row
+            else:
+                try:
+                    transformed = row_transform(row, seen_dates)
+                    if not isinstance(transformed, dict):
+                        raise TypeError("row_transform must return a record or raise InvalidStockRow")
+                except InvalidStockRow as error:
+                    if rows_seen > offset:
+                        LOGGER.warning("Skipping CSV data row %s: %s", rows_seen, error)
             if rows_seen <= offset:
                 continue
-            rows.append(row)
-            if len(rows) == window_size:
+            if transformed is not None:
+                rows.append(transformed)
+            # The window counts source records, including explicitly rejected rows.
+            if rows_seen - offset == window_size:
                 break
 
     if rows_seen < offset:
         raise ValueError("Saved offset exceeds the dataset length; check for a replaced or truncated file")
-    if rows:
-        variable_store.set(offset_variable, str(offset + len(rows)))
+    consumed = max(0, rows_seen - offset)
+    if consumed:
+        variable_store.set(offset_variable, str(offset + consumed))
 
-    LOGGER.info("Read %s stock rows; offset %s -> %s", len(rows), offset, offset + len(rows))
+    LOGGER.info(
+        "Read %s source rows: accepted %s, rejected %s; offset %s -> %s",
+        consumed, len(rows), consumed - len(rows), offset, offset + consumed,
+    )
     return rows
