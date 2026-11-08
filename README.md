@@ -4,7 +4,9 @@ The pipeline reads a fixed window of daily Mastercard stock records from CSV,
 cleans and validates each record, and stores the next source-row offset in an
 Airflow Variable. Ingestion uses Python's `csv` and `os` modules. Phase 2 uses
 `pandas.to_datetime()` for dates, `float()` for numeric validation, and `.strip()`
-to remove surrounding whitespace.
+to remove surrounding whitespace. Phase 3 analyzes the clean window to find the
+day with the highest `High` and the day with the lowest `Low`. Phase 4 writes
+those two records to a date-range-named CSV under `data/output/`.
 
 ## Dataset
 
@@ -20,7 +22,8 @@ Additional columns, including `Dividends` and `Stock Splits`, are preserved.
 
 The reader is in `dags/mastercard_pipeline/ingestion.py`. The DAG invokes
 `read_clean_stock_window()` from `dags/mastercard_pipeline/cleaning.py` to combine
-ingestion and cleaning within the same task.
+ingestion and cleaning within the same task. Its clean-window XCom feeds the
+downstream `analyze_stock_data` task.
 
 1. Check that the dataset file exists using `os.path.isfile`.
 2. Read `mastercard_stock_offset` using `Variable.get`, defaulting to `0`.
@@ -78,6 +81,77 @@ to guess record boundaries after broken quoting. Standalone
 Calling the original `read_stock_window()` without a row transform retains the
 strict Phase 1 behavior: invalid records raise an error instead of being skipped.
 
+## Phase 3: window analysis
+
+`analyze_stock_window(rows)` in `dags/mastercard_pipeline/analysis.py` receives
+the cleaned records and returns two full source rows:
+
+- `highest`: the row whose `High` value is greatest.
+- `lowest`: the row whose `Low` value is smallest.
+
+Prices are compared numerically with `Decimal`, using `max()` and `min()`.
+The returned records retain all source columns, readable dates, and original
+numeric strings, so source precision is preserved for later export. The input
+window is not changed. Price comparisons use `High` and `Low`, independently of
+`Open` and `Close`.
+
+Records are explicitly ordered by trading date for comparison. If several rows
+share an extreme price, the earliest trading date wins. For a one-row window,
+both results contain that row as independent copies. For an empty window (EOF or
+all source records rejected by cleaning), the result is
+`{"highest": null, "lowest": null}`. Invalid analysis inputs, including missing
+fields, non-finite/nonpositive prices, or dates that have not been normalized,
+fail explicitly instead of silently affecting the result.
+
+The DAG runs `ingest_stock_data` followed by `analyze_stock_data`. The second task
+reads the first task's XCom; it does not reopen the CSV or update the offset.
+Its `return_value` XCom contains the analysis result consumed by `save_to_csv`.
+To recompute an existing window, rerun `analyze_stock_data` and `save_to_csv`,
+which reuse that run's cleaned XCom and leave ingestion progress unchanged.
+
+## Phase 4: CSV result export
+
+`export_stock_results(results, rows, output_dir=None)` in
+`dags/mastercard_pipeline/export.py` receives the analysis result and its clean
+window. The downstream `save_to_csv` task writes a UTF-8 CSV with this header:
+
+```csv
+type,date,open,high_or_low,close,volume
+```
+
+There are exactly two data rows, in this order:
+
+- `HIGHEST`: the selected row's `Date`, `Open`, `High`, `Close`, and `Volume`.
+- `LOWEST`: the selected row's `Date`, `Open`, `Low`, `Close`, and `Volume`.
+
+These are summary columns: `Date`, `Open`, `Close`, and `Volume` become lowercase
+names; `high_or_low` holds the relevant extreme price; `type` labels that extreme.
+`Dividends`, `Stock Splits`, other source fields, and the opposite price are omitted
+from this summary, while remaining available in the clean and analytical XComs.
+Numeric strings retain source precision without rounding.
+
+The filename uses the earliest and latest accepted dates across the **entire
+clean window**, sorted explicitly, even when neither extreme falls on a boundary.
+For example, a window covering August 14-18, 2006 produces
+`data/output/2006-08-14_to_2006-08-18.csv`. Rejected records do not determine the
+date range. A one-row window uses the same date at both ends and still exports
+both labeled rows. An empty clean window creates no file and returns `None`.
+
+The output directory is created if needed. Set `MASTERCARD_OUTPUT_DIR` in the
+worker environment or pass `output_dir` explicitly to change it. The default
+outside Docker is this checkout's `data/output/`. In Docker, `/opt/airflow/output`
+maps to that host directory. The raw dataset remains unchanged and all output
+stays ignored by Git.
+
+Writing uses `csv.DictWriter` and a temporary file in the destination directory,
+then `os.replace` publishes the completed file. Re-exporting the same range
+replaces the file rather than appending records. Write errors fail the task,
+remove its temporary file, and preserve an existing completed CSV. The task's
+`return_value` XCom is the absolute output path (inside the container for Docker).
+To retry an export, clear **only `save_to_csv`** for that run; its existing upstream
+XComs supply the same window without advancing the offset. Ingestion still
+checkpoints before downstream work; see the recovery limitation below.
+
 ## Windows virtual environment
 
 A Python 3.12 virtual environment is available in `.venv/`, which is ignored by
@@ -97,7 +171,8 @@ You can also use its interpreter directly without activation:
 
 The test suite uses `unittest` and requires the pandas dependency in
 `requirements.txt`. The pinned version matches the existing Airflow Docker image.
-This environment supports local development and the ingestion/cleaning tests.
+This environment supports local development and the ingestion, cleaning, and
+analysis and export tests.
 For running the Airflow DAG, use Docker Compose below or the Linux/WSL2 setup
 in a separate Linux checkout. Keep its Linux virtual environment separate from
 this Windows `.venv`.
@@ -128,6 +203,7 @@ That error alone does not establish that a BIOS setting is disabled. Verify that
 From the repository root in PowerShell, with the Kaggle CSV already in `data/`:
 
 ```powershell
+New-Item -ItemType Directory -Force data/output | Out-Null
 docker compose config --quiet
 docker compose up --detach --wait --wait-timeout 180
 docker compose ps
@@ -144,7 +220,9 @@ docker compose logs airflow
 The web UI is bound to localhost. If port 8080 is already occupied, set
 `$env:AIRFLOW_PORT = "8081"` before starting and use http://localhost:8081.
 
-The DAGs and dataset are mounted read-only. The `airflow-home` named volume
+The DAGs and source dataset are mounted read-only. A separate writable bind
+mount exposes `data/output/` at `/opt/airflow/output` for exported files.
+The `airflow-home` named volume
 persists the metadata database, Variables (including the ingestion offset),
 task history, logs, and generated login information across container restarts.
 No Airflow installation is required inside the Windows `.venv`.
@@ -158,8 +236,13 @@ docker compose exec airflow airflow dags unpause mastercard_stock_ingestion
 docker compose exec airflow airflow dags trigger mastercard_stock_ingestion
 ```
 
-Wait for `ingest_stock_data` to succeed in the UI. Its `return_value` XCom contains
-the batch. Check progress, then trigger again to read the next window:
+Wait for all three tasks to succeed in the UI:
+`ingest_stock_data` → `analyze_stock_data` → `save_to_csv`.
+The `ingest_stock_data` task's
+`return_value` XCom contains the clean batch; the `analyze_stock_data` task's
+`return_value` XCom contains the `highest` and `lowest` records. The `save_to_csv`
+task returns the output path; inspect its CSV under `data/output/` on the host.
+Check progress, then trigger again to process and export the next window:
 
 ```powershell
 docker compose exec airflow airflow variables get mastercard_stock_offset
@@ -228,11 +311,15 @@ and the `dags/mastercard_pipeline/` package into its DAGs folder. Make the same
 CSV available to every worker and set `MASTERCARD_DATASET_PATH` to its absolute
 path in the worker environment. Without that environment variable, the default
 path is `data/Mastercard_stock.csv` relative to this checkout, regardless of the
-process working directory.
+process working directory. Set `MASTERCARD_OUTPUT_DIR` to a writable, persistent
+output directory accessible to the export worker. For multiple workers, use a
+shared output location so exported files can be retrieved consistently.
 
 In the Airflow UI, unpause `mastercard_stock_ingestion` and trigger it manually.
-The DAG has no automatic schedule. Inspect the task's `return_value` XCom to see
-the small batch and the `mastercard_stock_offset` Variable to see its progress.
+The DAG has no automatic schedule. Inspect `ingest_stock_data`'s `return_value`
+XCom for the clean batch, and `analyze_stock_data`'s `return_value` for its price
+extrema. `save_to_csv` exports the CSV and returns its path in `return_value`.
+The `mastercard_stock_offset` Variable tracks source-row progress.
 Trigger again after completion to read the next batch. Alternatively, from a
 shell configured for the same Airflow instance:
 
@@ -257,15 +344,17 @@ secrets backend, which would mask updates.
 The DAG sets `max_active_runs=1` because reading and updating a Variable is not
 an atomic claim. Use a separate offset key for another dataset and serialize all
 callers sharing a key. This stage checkpoints a successfully examined and cleaned
-source window, before Airflow persists its XCom result or any future downstream
-processing. A crash after saving the offset can lose that
+source window, before Airflow persists its clean-window XCom, analyzes, or exports.
+A crash after saving the offset can lose that
 batch's handoff; this is not an exactly-once delivery mechanism. Automatic task
-retries are disabled. When adding transformations or loading, design their
-checkpoint/commit boundary before relying on retries or clearing completed tasks.
+retries are disabled. If analysis or export fails after its upstream XComs were
+saved, rerun only the failed downstream tasks. Clearing ingestion consumes a new
+window. A crash before the clean XCom is stored still requires manual recovery;
+file replacement alone does not make the whole pipeline exactly-once.
 
 ## Verify locally
 
-The ingestion and cleaning tests require pandas, but do not require Airflow or
+The ingestion, cleaning, analysis, and export tests require pandas, but do not require Airflow or
 the Kaggle download. From the repository root in an activated environment:
 
 ```bash
@@ -277,5 +366,11 @@ Tests use synthetic CSV files and an in-memory replacement for Airflow Variables
 to check successive windows, whitespace trimming, readable local dates, invalid
 numbers/prices, rejection reporting, duplicate dates, source precision, and
 checkpoint behavior for partial, empty, and all-rejected windows. Unexpected
-errors are checked for unchanged offsets. A live DAG run additionally requires a
-configured Airflow instance and its metadata store.
+errors are checked for unchanged offsets. Analysis tests cover numeric extrema,
+exact decimal comparisons, unsorted inputs and ties, empty/single-row windows,
+source-field preservation, and independent results for successive windows.
+Export tests cover the exact CSV schema, full-window date ranges, decimal-string
+preservation, repeated exports, write failures, output configuration, and the
+full ingestion-to-export flow through rejected, partial, and empty windows.
+A live DAG run additionally requires a configured Airflow instance and its
+metadata store.
